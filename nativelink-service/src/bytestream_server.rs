@@ -105,6 +105,7 @@ impl Drop for ActiveStreamGuard<'_> {
         let Some(stream_state) = self.stream_state.take() else {
             return; // If None it means we don't want it put back into an IdleStream.
         };
+
         let weak_active_uploads = Arc::downgrade(&self.bytestream_server.active_uploads);
         let mut active_uploads = self.bytestream_server.active_uploads.lock();
         let uuid = stream_state.uuid.clone();
@@ -156,21 +157,23 @@ impl IdleStream {
 type BytesWrittenAndIdleStream = (Arc<AtomicU64>, Option<IdleStream>);
 type SleepFn = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 
-pub struct ByteStreamServer {
-    stores: HashMap<String, Store>,
+#[derive(Debug)]
+struct ByteStreamStoreConfig {
+    store: Store,
     // Max number of bytes to send on each grpc stream chunk.
     max_bytes_per_stream: usize,
-    max_decoding_message_size: usize,
+}
+
+pub struct ByteStreamServer {
+    store_configs: HashMap<String, ByteStreamStoreConfig>,
     active_uploads: Arc<Mutex<HashMap<String, BytesWrittenAndIdleStream>>>,
     sleep_fn: SleepFn,
 }
 
 impl Debug for ByteStreamServer {
-    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ByteStreamServer")
-            .field("stores", &self.stores)
-            .field("max_bytes_per_stream", &self.max_bytes_per_stream)
-            .field("max_decoding_message_size", &self.max_decoding_message_size)
+            .field("store_configs", &self.store_configs)
             .field("active_uploads", &self.active_uploads)
             .finish_non_exhaustive()
     }
@@ -178,52 +181,43 @@ impl Debug for ByteStreamServer {
 
 impl ByteStreamServer {
     pub fn new(config: &ByteStreamConfig, store_manager: &StoreManager) -> Result<Self, Error> {
-        let mut persist_stream_on_disconnect_timeout =
-            Duration::from_secs(config.persist_stream_on_disconnect_timeout as u64);
-        if config.persist_stream_on_disconnect_timeout == 0 {
-            persist_stream_on_disconnect_timeout = DEFAULT_PERSIST_STREAM_ON_DISCONNECT_TIMEOUT;
+        let mut store_configs = HashMap::with_capacity(config.stores.len());
+        for config in &config.stores {
+            let store = store_manager.get_store(&config.cas_store).ok_or_else(|| {
+                make_input_err!("'cas_store': '{}' does not exist", *config.cas_store)
+            })?;
+            let max_bytes_per_stream = if config.max_bytes_per_stream == 0 {
+                DEFAULT_MAX_BYTES_PER_STREAM
+            } else {
+                config.max_bytes_per_stream
+            };
+            store_configs.insert(
+                config.cas_store.instance_name.to_string(),
+                ByteStreamStoreConfig {
+                    store,
+                    max_bytes_per_stream,
+                },
+            );
         }
-        Self::new_with_sleep_fn(
-            config,
-            store_manager,
-            Arc::new(move || Box::pin(sleep(persist_stream_on_disconnect_timeout))),
-        )
-    }
 
-    pub fn new_with_sleep_fn(
-        config: &ByteStreamConfig,
-        store_manager: &StoreManager,
-        sleep_fn: SleepFn,
-    ) -> Result<Self, Error> {
-        let mut stores = HashMap::with_capacity(config.cas_stores.len());
-        for (instance_name, store_name) in &config.cas_stores {
-            let store = store_manager
-                .get_store(store_name)
-                .ok_or_else(|| make_input_err!("'cas_store': '{}' does not exist", store_name))?;
-            stores.insert(instance_name.to_string(), store);
-        }
-        let max_bytes_per_stream = if config.max_bytes_per_stream == 0 {
-            DEFAULT_MAX_BYTES_PER_STREAM
-        } else {
-            config.max_bytes_per_stream
-        };
-        let max_decoding_message_size = if config.max_decoding_message_size == 0 {
-            DEFAULT_MAX_DECODING_MESSAGE_SIZE
-        } else {
-            config.max_decoding_message_size
-        };
+        let persist_stream_on_disconnect_timeout =
+            if config.persist_stream_on_disconnect_timeout == 0 {
+                DEFAULT_PERSIST_STREAM_ON_DISCONNECT_TIMEOUT
+            } else {
+                Duration::from_secs(config.persist_stream_on_disconnect_timeout as u64)
+            };
+        let sleep_fn: SleepFn =
+            Arc::new(move || Box::pin(sleep(persist_stream_on_disconnect_timeout)));
+
         Ok(ByteStreamServer {
-            stores,
-            max_bytes_per_stream,
-            max_decoding_message_size,
+            store_configs,
             active_uploads: Arc::new(Mutex::new(HashMap::new())),
             sleep_fn,
         })
     }
 
     pub fn into_service(self) -> Server<Self> {
-        let max_decoding_message_size = self.max_decoding_message_size;
-        Server::new(self).max_decoding_message_size(max_decoding_message_size)
+        Server::new(self)
     }
 
     fn create_or_join_upload_stream(
@@ -282,7 +276,7 @@ impl ByteStreamServer {
         read_request: ReadRequest,
     ) -> Result<impl Stream<Item = Result<ReadResponse, Status>> + Send + use<>, Error> {
         struct ReaderState {
-            max_bytes_per_stream: usize,
+            // max_bytes_per_stream: usize,
             rx: DropCloserReadHalf,
             maybe_get_part_result: Option<Result<(), Error>>,
             get_part_fut: Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>,
@@ -302,7 +296,8 @@ impl ByteStreamServer {
         // This allows us to call a destructor when the the object is dropped.
         let state = Some(ReaderState {
             rx,
-            max_bytes_per_stream: self.max_bytes_per_stream,
+            // FIXME(jhpratt) this is now a per-config setting
+            // max_bytes_per_stream: self.max_bytes_per_stream,
             maybe_get_part_result: None,
             get_part_fut: Box::pin(async move {
                 store
@@ -528,16 +523,9 @@ impl ByteStreamServer {
     ) -> Result<Response<QueryWriteStatusResponse>, Error> {
         let mut resource_info = ResourceInfo::new(&query_request.resource_name, true)?;
 
-        let store_clone = self
-            .stores
-            .get(resource_info.instance_name.as_ref())
-            .err_tip(|| {
-                format!(
-                    "'instance_name' not configured for '{}'",
-                    &resource_info.instance_name
-                )
-            })?
-            .clone();
+        // FIXME(jhpratt) this is now a per-config setting, so it needs to be determined which store
+        // is being used
+        let store_clone = self.store.clone();
 
         let digest = DigestInfo::try_new(resource_info.hash.as_ref(), resource_info.expected_size)?;
 
@@ -595,18 +583,17 @@ impl ByteStream for ByteStreamServer {
     )]
     async fn read(
         &self,
+        // TODO(jhpratt) Add `instance_name` to the request, as is the case with other stores. Do
+        // this for all relevant requests.
         grpc_request: Request<ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
         let read_request = grpc_request.into_inner();
         let ctx = OriginEventContext::new(|| &read_request).await;
 
         let resource_info = ResourceInfo::new(&read_request.resource_name, false)?;
-        let instance_name = resource_info.instance_name.as_ref();
-        let store = self
-            .stores
-            .get(instance_name)
-            .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?
-            .clone();
+        // FIXME(jhpratt) this is now a per-config setting, so it needs to be determined which store
+        // is being used
+        let store = self.store.clone();
 
         let digest = DigestInfo::try_new(resource_info.hash.as_ref(), resource_info.expected_size)?;
 
@@ -660,12 +647,9 @@ impl ByteStream for ByteStreamServer {
             .err_tip(|| "Could not unwrap first stream message")
             .map_err(Into::<Status>::into)?;
 
-        let instance_name = stream.resource_info.instance_name.as_ref();
-        let store = self
-            .stores
-            .get(instance_name)
-            .err_tip(|| format!("'instance_name' not configured for '{instance_name}'"))?
-            .clone();
+        // FIXME(jhpratt) this is now a per-config setting, so it needs to be determined which store
+        // is being used
+        let store = self.store.clone();
 
         let digest = DigestInfo::try_new(
             &stream.resource_info.hash,
